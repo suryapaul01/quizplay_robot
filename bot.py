@@ -16,6 +16,7 @@ from handlers.stats import get_stats_handlers
 from handlers.group import get_group_handlers
 from handlers.admin import get_admin_handlers
 from handlers.premium import get_premium_handlers
+from handlers.language import get_language_handlers
 
 # Configure logging - reduced verbosity
 logging.basicConfig(
@@ -42,6 +43,7 @@ async def post_init(application: Application) -> None:
         ("browse", "Browse public quizzes"),
         ("stats", "Your statistics"),
         ("premium", "Premium plans"),
+        ("setlang", "Set language"),
         ("help", "Show help"),
     ])
     
@@ -106,6 +108,10 @@ def main():
     
     # Add premium handlers
     for handler in get_premium_handlers():
+        application.add_handler(handler)
+    
+    # Add language handlers
+    for handler in get_language_handlers():
         application.add_handler(handler)
     
     # Add group handlers

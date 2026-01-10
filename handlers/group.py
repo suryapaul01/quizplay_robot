@@ -1,6 +1,6 @@
 """
 Group Chat Quiz Handler - Using Telegram Native Quiz Polls
-Admin-only quiz starting, countdown timer display, new scoring system
+Admin-only quiz starting, countdown timer display, new scoring system, language support
 """
 import asyncio
 from datetime import datetime
@@ -18,13 +18,16 @@ from utils.helpers import (
     escape_html, format_leaderboard,
     format_question_for_poll, calculate_score
 )
-from config import JOIN_COUNTDOWN, DEFAULT_QUESTION_TIME
+from utils.translator import translate_questions_batch
+from config import JOIN_COUNTDOWN, DEFAULT_QUESTION_TIME, SUPPORTED_LANGUAGES
 
 
 # Store active polls: {poll_id: {...}}
 active_polls = {}
 # Store countdown tasks: {chat_id: task}
 countdown_tasks = {}
+# Store pending quiz starts: {chat_id: {group_id, admin_id, message_id}}
+pending_quiz_starts = {}
 
 
 def join_quiz_keyboard(group_id: str) -> InlineKeyboardMarkup:
@@ -33,8 +36,26 @@ def join_quiz_keyboard(group_id: str) -> InlineKeyboardMarkup:
     return InlineKeyboardMarkup(keyboard)
 
 
+def language_select_keyboard(group_id: str, admin_id: int) -> InlineKeyboardMarkup:
+    """Language selection keyboard for quiz start (2 columns)"""
+    keyboard = []
+    items = list(SUPPORTED_LANGUAGES.items())
+    
+    for i in range(0, len(items), 2):
+        row = []
+        for j in range(2):
+            if i + j < len(items):
+                code, name = items[i + j]
+                # Use pipe separator to avoid conflict with group_id underscores
+                row.append(InlineKeyboardButton(name, callback_data=f"qlang|{group_id}|{admin_id}|{code}"))
+        keyboard.append(row)
+    
+    keyboard.append([InlineKeyboardButton("❌ Cancel", callback_data=f"qcancel|{group_id}|{admin_id}")])
+    return InlineKeyboardMarkup(keyboard)
+
+
 async def startquiz_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    """Handle /startquiz command in groups - ADMIN ONLY"""
+    """Handle /startquiz command in groups - ADMIN ONLY with language selection"""
     chat = update.effective_chat
     user = update.effective_user
     
@@ -88,48 +109,173 @@ async def startquiz_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
         await update.message.reply_text("❌ This quiz has no questions!")
         return
     
-    # Create active game
-    await create_active_game(
+    # Store pending quiz data
+    pending_quiz_starts[chat.id] = {
+        'group_id': group_id,
+        'admin_id': user.id,
+        'quiz_group': quiz_group,
+        'questions': questions
+    }
+    
+    # Delete the command message
+    try:
+        await update.message.delete()
+    except Exception:
+        pass
+    
+    # Show language selection
+    msg = await context.bot.send_message(
         chat_id=chat.id,
-        group_id=group_id,
-        quiz_id=group_id,
-        started_by=user.id
+        text=f"🌐 <b>Select Quiz Language</b>\n\n"
+             f"📚 {escape_html(quiz_group['name'])}\n"
+             f"❓ {len(questions)} questions\n\n"
+             f"Choose language for this quiz:",
+        parse_mode=ParseMode.HTML,
+        reply_markup=language_select_keyboard(group_id, user.id)
     )
     
-    # Store settings in chat_data
-    context.chat_data['extra_points'] = quiz_group.get('extra_points', True)
-    context.chat_data['time_limit'] = DEFAULT_QUESTION_TIME
-    context.chat_data['group_id'] = group_id
+    pending_quiz_starts[chat.id]['message_id'] = msg.message_id
+
+
+async def quizlang_callback(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    """Handle language selection for quiz start"""
+    query = update.callback_query
+    chat = update.effective_chat
+    user = query.from_user
+    
+    # Parse callback data: qlang|groupid|adminid|langcode (using pipe separator)
+    parts = query.data.split("|")
+    if len(parts) < 4:
+        await query.answer("Invalid selection!", show_alert=True)
+        return
+    
+    group_id = parts[1]
+    admin_id = int(parts[2])
+    lang_code = parts[3]
+    
+    # Verify it's the same admin who started
+    if user.id != admin_id:
+        await query.answer("❌ Only the admin who started can select language!", show_alert=True)
+        return
+    
+    # Get pending data
+    pending = pending_quiz_starts.get(chat.id)
+    if not pending or pending['group_id'] != group_id:
+        await query.answer("Quiz session expired! Try again.", show_alert=True)
+        try:
+            await query.message.delete()
+        except Exception:
+            pass
+        return
+    
+    await query.answer(f"Starting quiz in {SUPPORTED_LANGUAGES.get(lang_code, lang_code)}...")
+    
+    # Delete the language selection message
+    try:
+        await query.message.delete()
+    except Exception:
+        pass
+    
+    # Start the quiz with selected language
+    await start_quiz_with_language(
+        context.bot,
+        chat.id,
+        pending['group_id'],
+        pending['quiz_group'],
+        pending['questions'],
+        user.id,
+        lang_code,
+        context.chat_data
+    )
+    
+    # Clean up pending
+    del pending_quiz_starts[chat.id]
+
+
+async def quizcancel_callback(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    """Handle quiz cancel"""
+    query = update.callback_query
+    chat = update.effective_chat
+    user = query.from_user
+    
+    # Parse: qcancel|groupid|adminid
+    parts = query.data.split("|")
+    if len(parts) < 3:
+        await query.answer("Invalid!", show_alert=True)
+        return
+    
+    admin_id = int(parts[2])
+    
+    if user.id != admin_id:
+        await query.answer("❌ Only the admin who started can cancel!", show_alert=True)
+        return
+    
+    # Clean up
+    if chat.id in pending_quiz_starts:
+        del pending_quiz_starts[chat.id]
+    
+    try:
+        await query.message.delete()
+    except Exception:
+        pass
+    
+    await query.answer("Quiz cancelled!")
+
+
+async def start_quiz_with_language(bot, chat_id: int, group_id: str, quiz_group: dict, questions: list, started_by: int, lang_code: str, chat_data: dict):
+    """Start quiz with the selected language"""
+    
+    # Translate questions if not English
+    if lang_code != "en":
+        questions = await translate_questions_batch(questions, lang_code)
+    
+    # Create active game
+    await create_active_game(
+        chat_id=chat_id,
+        group_id=group_id,
+        quiz_id=group_id,
+        started_by=started_by
+    )
+    
+    # Store settings
+    chat_data['extra_points'] = quiz_group.get('extra_points', True)
+    chat_data['time_limit'] = DEFAULT_QUESTION_TIME
+    chat_data['group_id'] = group_id
+    chat_data['quiz_language'] = lang_code
+    chat_data['translated_questions'] = questions
     
     # Show join message with countdown
     extra_text = "⚡ Speed Bonus: ON" if quiz_group.get('extra_points', True) else "📝 Speed Bonus: OFF"
+    lang_name = SUPPORTED_LANGUAGES.get(lang_code, lang_code)
     
     text = f"🎯 <b>{escape_html(quiz_group['name'])}</b>\n\n"
+    text += f"🌐 Language: {lang_name}\n"
     text += f"❓ Questions: {len(questions)}\n"
     text += f"⏱️ Time per question: {DEFAULT_QUESTION_TIME}s\n"
     text += f"{extra_text}\n\n"
     text += f"Click below to join!\n\n"
     text += f"⏰ <b>Starting in {JOIN_COUNTDOWN} seconds...</b>"
     
-    msg = await update.message.reply_text(
-        text,
+    msg = await bot.send_message(
+        chat_id=chat_id,
+        text=text,
         parse_mode=ParseMode.HTML,
         reply_markup=join_quiz_keyboard(group_id)
     )
     
-    context.chat_data['join_message_id'] = msg.message_id
-    context.chat_data['quiz_group'] = quiz_group
-    context.chat_data['question_count'] = len(questions)
+    chat_data['join_message_id'] = msg.message_id
+    chat_data['quiz_group'] = quiz_group
+    chat_data['question_count'] = len(questions)
     
     # Cancel any existing countdown
-    if chat.id in countdown_tasks:
-        countdown_tasks[chat.id].cancel()
+    if chat_id in countdown_tasks:
+        countdown_tasks[chat_id].cancel()
     
     # Start countdown with timer updates
     task = asyncio.create_task(
-        countdown_and_start(context.bot, chat.id, group_id, msg.message_id, quiz_group, len(questions), context.chat_data)
+        countdown_and_start(bot, chat_id, group_id, msg.message_id, quiz_group, len(questions), chat_data)
     )
-    countdown_tasks[chat.id] = task
+    countdown_tasks[chat_id] = task
 
 
 async def countdown_and_start(bot, chat_id: int, group_id: str, message_id: int, quiz_group: dict, question_count: int, chat_data: dict):
@@ -191,8 +337,11 @@ async def countdown_and_start(bot, chat_id: int, group_id: str, message_id: int,
         await delete_active_game(chat_id)
         return
     
-    # Get questions
-    questions = await get_group_questions(group_id)
+    # Get questions - use translated if available
+    questions = chat_data.get('translated_questions')
+    if not questions:
+        questions = await get_group_questions(group_id)
+    
     if not questions:
         await bot.send_message(chat_id=chat_id, text="❌ No questions found! Quiz cancelled.")
         await delete_active_game(chat_id)
@@ -278,6 +427,8 @@ async def run_quiz(bot, chat_id: int, questions: list, game: dict, extra_points:
             await update_active_game(chat_id, current_poll_id=poll_id)
             
         except Exception as e:
+            # Even on error, wait before next question
+            await asyncio.sleep(2)
             continue
         
         # Wait for poll to close
@@ -304,6 +455,9 @@ async def run_quiz(bot, chat_id: int, questions: list, game: dict, extra_points:
                         leaderboard_text += f"{medal} {escape_html(username)} - {score} pts\n"
                     
                     await bot.send_message(chat_id=chat_id, text=leaderboard_text, parse_mode=ParseMode.HTML)
+            
+            # Small delay after leaderboard before next question
+            await asyncio.sleep(3)
     
     # Quiz complete - show final results
     await show_final_results(bot, chat_id, game['group_id'], total_questions)
@@ -490,6 +644,9 @@ def get_group_handlers():
         CommandHandler("startquiz", startquiz_command),
         CommandHandler("stop", stop_command),
         CommandHandler("leaderboard", leaderboard_command),
+        CallbackQueryHandler(quizlang_callback, pattern=r"^qlang\|"),
+        CallbackQueryHandler(quizcancel_callback, pattern=r"^qcancel\|"),
         CallbackQueryHandler(join_quiz_callback, pattern="^join_"),
         PollAnswerHandler(poll_answer_handler),
     ]
+

@@ -1,5 +1,5 @@
 """
-Browse Public Quizzes Handler - with Solo Play Feature
+Browse Public Quizzes Handler - with Solo Play Feature and Translation
 """
 from telegram import Update, InlineKeyboardButton, InlineKeyboardMarkup, Poll
 from telegram.ext import ContextTypes, CommandHandler, MessageHandler, CallbackQueryHandler, filters
@@ -9,10 +9,11 @@ from datetime import datetime
 
 from database.models import (
     get_public_quiz_groups, get_quiz_group, get_group_questions,
-    count_public_quiz_groups, save_score, create_user
+    count_public_quiz_groups, save_score, create_user, get_user_language
 )
 from utils.helpers import get_category_name, escape_html, format_question_for_poll, calculate_score
-from config import CATEGORIES, DEFAULT_QUESTION_TIME
+from utils.translator import translate_questions_batch
+from config import CATEGORIES, DEFAULT_QUESTION_TIME, SUPPORTED_LANGUAGES
 
 QUIZZES_PER_PAGE = 5
 MIN_PLAYS_REQUIRED = 2
@@ -245,13 +246,22 @@ async def play_solo_callback(update: Update, context: ContextTypes.DEFAULT_TYPE)
         await query.answer("No questions in this quiz!", show_alert=True)
         return
     
+    # Get user's preferred language
+    user_lang = await get_user_language(user.id)
+    lang_name = SUPPORTED_LANGUAGES.get(user_lang, user_lang)
+    
     await query.edit_message_text(
         f"🎮 <b>Starting Solo Quiz!</b>\n\n"
         f"📚 {escape_html(quiz['name'])}\n"
-        f"❓ {len(questions)} questions\n\n"
+        f"❓ {len(questions)} questions\n"
+        f"🌐 Language: {lang_name}\n\n"
         f"Get ready...",
         parse_mode=ParseMode.HTML
     )
+    
+    # Translate questions if not English
+    if user_lang != "en":
+        questions = await translate_questions_batch(questions, user_lang)
     
     await asyncio.sleep(2)
     
@@ -260,7 +270,7 @@ async def play_solo_callback(update: Update, context: ContextTypes.DEFAULT_TYPE)
 
 
 async def run_solo_quiz(context, chat_id: int, user, quiz: dict, questions: list):
-    """Run solo quiz for a user"""
+    """Run solo quiz for a user - moves to next question immediately when answered"""
     total_questions = len(questions)
     time_limit = DEFAULT_QUESTION_TIME
     extra_points = quiz.get('extra_points', True)
@@ -293,11 +303,24 @@ async def run_solo_quiz(context, chat_id: int, user, quiz: dict, questions: list
             'question_num': i
         }
         
-        # Wait for poll to close
-        await asyncio.sleep(time_limit + 2)
+        # Wait for user to answer OR timeout
+        # Check every 0.5 seconds if user has answered
+        result_key = f"solo_result_{poll_id}"
+        elapsed = 0
+        answered = False
+        
+        while elapsed < time_limit + 1:
+            await asyncio.sleep(0.5)
+            elapsed += 0.5
+            
+            # Check if user answered
+            if result_key in context.bot_data:
+                answered = True
+                # Small delay to show the correct answer
+                await asyncio.sleep(1.5)
+                break
         
         # Get result if stored
-        result_key = f"solo_result_{poll_id}"
         if result_key in context.bot_data:
             result = context.bot_data.pop(result_key)
             total_score += result['points']

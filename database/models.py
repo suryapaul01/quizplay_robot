@@ -80,6 +80,23 @@ async def set_admin(user_id: int, is_admin: bool = True) -> bool:
     return result.modified_count > 0
 
 
+async def update_user_language(user_id: int, language: str) -> bool:
+    """Update user's preferred language"""
+    db = get_db()
+    result = await db.users.update_one(
+        {"user_id": user_id},
+        {"$set": {"language": language}}
+    )
+    return result.modified_count > 0
+
+
+async def get_user_language(user_id: int) -> str:
+    """Get user's preferred language"""
+    db = get_db()
+    user = await db.users.find_one({"user_id": user_id})
+    return user.get("language", "en") if user else "en"
+
+
 async def get_all_users() -> List[dict]:
     """Get all BOT users for broadcast (excludes group-only participants)"""
     db = get_db()
