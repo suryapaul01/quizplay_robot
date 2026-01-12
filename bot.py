@@ -32,11 +32,7 @@ logger.setLevel(logging.INFO)
 
 async def post_init(application: Application) -> None:
     """Initialize after application start"""
-    # Connect to database
-    connected = await connect_db()
-    if not connected:
-        logger.error("Failed to connect to database!")
-        return
+    # Database is already connected in main()
     
     # Set bot commands
     await application.bot.set_my_commands([
@@ -107,6 +103,13 @@ async def main():
     
     # Start health check server first
     runner = await run_health_server()
+    
+    # Connect to database early (before handlers run)
+    connected = await connect_db()
+    if not connected:
+        logger.error("[ERROR] Failed to connect to database! Exiting...")
+        await runner.cleanup()
+        return
     
     # Create application
     application = Application.builder().token(BOT_TOKEN).post_init(post_init).post_shutdown(post_shutdown).build()
