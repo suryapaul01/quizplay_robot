@@ -2,6 +2,9 @@
 Quiz Master Bot - Main Entry Point
 """
 import logging
+import asyncio
+import os
+from aiohttp import web
 from telegram.ext import Application
 
 from config import BOT_TOKEN
@@ -75,11 +78,35 @@ async def error_handler(update, context):
     logger.error(f"Error: {error}")
 
 
-def main():
+# Health check endpoint for Koyeb
+async def health_check(request):
+    """Health check endpoint for deployment platforms"""
+    return web.Response(text="OK", status=200)
+
+
+async def run_health_server():
+    """Run the health check web server"""
+    app = web.Application()
+    app.router.add_get("/", health_check)
+    app.router.add_get("/health", health_check)
+    
+    port = int(os.getenv("PORT", 8080))
+    runner = web.AppRunner(app)
+    await runner.setup()
+    site = web.TCPSite(runner, "0.0.0.0", port)
+    await site.start()
+    logger.info(f"[HEALTH] Health check server running on port {port}")
+    return runner
+
+
+async def main():
     """Main function to run the bot"""
     if not BOT_TOKEN:
         logger.error("[ERROR] BOT_TOKEN not set! Please set it in .env file.")
         return
+    
+    # Start health check server first
+    runner = await run_health_server()
     
     # Create application
     application = Application.builder().token(BOT_TOKEN).post_init(post_init).post_shutdown(post_shutdown).build()
@@ -124,9 +151,26 @@ def main():
     
     # Start the bot
     logger.info("[START] Starting Quiz Master Bot...")
-    application.run_polling(drop_pending_updates=True)
+    
+    # Initialize and start polling
+    await application.initialize()
+    await application.start()
+    await application.updater.start_polling(drop_pending_updates=True)
+    
+    # Keep running until interrupted
+    try:
+        while True:
+            await asyncio.sleep(3600)
+    except asyncio.CancelledError:
+        pass
+    finally:
+        # Cleanup
+        await application.updater.stop()
+        await application.stop()
+        await application.shutdown()
+        await runner.cleanup()
 
 
 if __name__ == "__main__":
-    main()
+    asyncio.run(main())
 
